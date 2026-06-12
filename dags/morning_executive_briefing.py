@@ -1,4 +1,5 @@
-"""Morning Executive Briefing — workshop demo DAG.
+"""
+Morning Executive Briefing — workshop demo DAG.
 
 Pattern: fan-out -> join -> load.
 
@@ -6,16 +7,10 @@ Pattern: fan-out -> join -> load.
     fetch_marketing ─┼─► aggregate_data ─► generate_and_send_report
     fetch_support   ─┘
 
-Three extract tasks run in parallel (each a separate KubernetesExecutor pod),
-`aggregate_data` only starts once all three succeed, then the report step runs.
+Three extract tasks run in parallel (each a separate KubernetesExecutor pod), `aggregate_data` only starts once all
+three succeed, then the report step runs.
 
-Demo simplifications (mention these when presenting):
-  1. Data is GENERATED ON THE FLY inside the fetch_* tasks — not read from S3.
-  2. This file is delivered with `kubectl cp` into the shared dags volume — not git-synced.
-  3. The final step LOGS the report — it does not send a real email.
-
-`aggregate_data` is a KubernetesPodOperator: it runs in its own plain `python`
-container to make the point that *any* container image can be an Airflow task.
+`aggregate_data` is a KubernetesPodOperator: it runs in its own plain `python` container to make the point that *any* container image can be an Airflow task.
 """
 
 from __future__ import annotations
@@ -23,13 +18,26 @@ from __future__ import annotations
 import datetime
 
 from airflow.sdk import DAG
+from airflow.sdk import Param
+from airflow.sdk import Variable
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 
+# DEMO knob: how many of fetch_support's executions fail before it succeeds, counted PER DAG RUN and persisted in an
+# Airflow Variable so the count survives a manual "Clear" (unlike try_number, which resets on Clear).
+# With retries=1 there are 2 automatic executions per run, so:
+#   0 -> never fails (happy path)
+#   1 -> attempt 1 fails, the automatic retry succeeds (auto-retry demo)
+#   2 -> both automatic attempts fail -> task goes RED; the next execution only
+#        happens because we clear it, and it succeeds (manual-clear demo)
+#   3+ -> stays red even after one Clear (needs that many re-runs)
+# Overridable per run from the UI via the `support_fail_attempts` DAG param.
+SUPPORT_FAIL_ATTEMPTS = 2
+
 
 # --- Extract tasks (fan-out) ---------------------------------------------
-# Each generates fake business data deterministically from the reference date so
-# every run produces stable, explainable numbers. Returned dicts land in XCom.
+# Each generates fake business data deterministically from the reference date so every run produces stable,
+# explainable numbers. Returned dicts land in XCom.
 
 def _ref_date(context) -> datetime.datetime:
     """A stable reference datetime.
@@ -40,7 +48,8 @@ def _ref_date(context) -> datetime.datetime:
     dt = context.get("logical_date") or context.get("data_interval_start")
     if dt is None:
         dag_run = context.get("dag_run")
-        dt = getattr(dag_run, "run_after", None) or getattr(dag_run, "queued_at", None)
+        dt = getattr(dag_run, "run_after", None) or getattr(
+            dag_run, "queued_at", None)
     if dt is None:
         dt = datetime.datetime.now(datetime.timezone.utc)
     return dt
@@ -63,6 +72,23 @@ def fetch_marketing(**context) -> dict:
 
 
 def fetch_support(**context) -> dict:
+    # DEMO: show BOTH recovery paths on one task, reliably.
+    # We count how many times this task has executed in THIS dag run using an Airflow Variable keyed by run_id. 
+    # The counter survives a manual "Clear", so clearing a red task lets it recover after n retries.
+    fail_attempts = int(context["params"].get(
+        "support_fail_attempts", SUPPORT_FAIL_ATTEMPTS))
+    run_id = context["dag_run"].run_id
+    counter_key = f"support_exec_count__{run_id}"
+    executions = int(Variable.get(counter_key, default="0")) + 1
+    Variable.set(counter_key, str(executions))
+
+    if executions <= fail_attempts:
+        raise RuntimeError(
+            f"[support] simulated upstream outage — execution #{executions} of this "
+            f"run (failing the first {fail_attempts}); retry/clear to resume the DAG")
+
+    # Recovered: clean up the per-run counter so reruns start fresh.
+    Variable.delete(counter_key)
     day = _ref_date(context).day
     tickets = 120 + (day * 7) % 60
     csat = round(4.2 + (day % 7) * 0.1, 2)
@@ -96,9 +122,8 @@ Date: {_ref_date(context).date()}
     return report
 
 
-# The aggregation runs in a separate plain `python` container. It reads the
-# three upstream results from env vars (templated XCom pulls) and pushes a
-# result back via /airflow/xcom/return.json (do_xcom_push=True).
+# The aggregation runs in a separate plain `python` container. It reads the three upstream results from env vars
+# (templated XCom pulls) and pushes a result back via /airflow/xcom/return.json (do_xcom_push=True).
 AGGREGATE_SCRIPT = """
 import json, os
 
@@ -133,6 +158,19 @@ with DAG(
     start_date=datetime.datetime(2026, 1, 1),
     catchup=False,
     tags=["demo", "workshop", "ist"],
+    params={
+        # Renders an integer field in "Trigger DAG w/ config".
+        "support_fail_attempts": Param(
+            SUPPORT_FAIL_ATTEMPTS,
+            type="integer",
+            minimum=0,
+            maximum=5,
+            title="fetch_support: attempts to fail before success",
+            description="How many fetch_support executions fail before it succeeds, "
+            "counted per run (survives Clear). With retries=1: 1 = auto-retry heals it; "
+            "2 = goes red after the retry, recovers on a manual Clear; 0 = never fails.",
+        ),
+    },
 ) as dag:
 
     fetch_sales_task = PythonOperator(
@@ -146,6 +184,10 @@ with DAG(
     fetch_support_task = PythonOperator(
         task_id="fetch_support",
         python_callable=fetch_support,
+        # One automatic retry (always triggered by the always-fail first attempt);
+        # if the retry also fails, the task goes red for the manual "Clear" demo.
+        retries=1,
+        retry_delay=datetime.timedelta(seconds=10),
     )
 
     aggregate_data = KubernetesPodOperator(
@@ -170,4 +212,5 @@ with DAG(
         python_callable=generate_and_send_report,
     )
 
-    [fetch_sales_task, fetch_marketing_task, fetch_support_task] >> aggregate_data >> report_task
+    [fetch_sales_task, fetch_marketing_task,
+        fetch_support_task] >> aggregate_data >> report_task
