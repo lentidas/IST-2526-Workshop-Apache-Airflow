@@ -1,0 +1,7 @@
+{
+  "go.goroot": "/Users/goncaloheleno/.local/share/mise/installs/go/1.26.2",
+  "python.defaultInterpreterPath": "/Users/goncaloheleno/.local/share/mise/installs/python/3.14.4/bin/python",
+  "go.alternateTools": {
+    "go": "/Users/goncaloheleno/.local/share/mise/shims/go"
+  }
+}

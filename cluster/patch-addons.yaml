@@ -1,0 +1,274 @@
+# Talos machine-config patch — cluster add-ons (storage + metrics)
+# ================================================================
+# Applied to the control-plane node at `talosctl cluster create` time. Everything
+# under `cluster.*` is read by the bootstrap node and reconciled into the cluster
+# automatically, so a fresh cluster comes up with storage + metrics already wired.
+#
+# How it loads:
+#   - cluster.extraManifests : URLs fetched at bootstrap (here: the k3s
+#     helm-controller, which adds the helm.cattle.io/v1 `HelmChart` CRD + a
+#     controller that runs `helm` for us).
+#   - cluster.inlineManifests: raw YAML embedded below. local-path is a plain
+#     (patched) manifest; nfs + metrics-server are delivered as `HelmChart` CRs
+#     that the helm-controller installs from their upstream Helm repos.
+#
+# Talos retries manifest application until it succeeds, so the HelmChart CRs
+# below tolerate the helm-controller CRD not being ready on the very first pass.
+#
+# Apply:
+#   talosctl cluster create docker ... \
+#     --config-patch-control-plane @cluster/patch-addons.yaml
+
+
+# Machine configuration to add basic storage and metrics add-ons to the Talos K8s cluster at startup.
+
+cluster:
+  # --- Helm support ------------------------------------------------------
+  # k3s helm-controller: installs the `HelmChart` / `HelmChartConfig` CRDs and a
+  # cluster-scoped controller (into kube-system) that turns HelmChart resources
+  # into real `helm install` jobs. This is what lets us "load Helm charts at
+  # startup" — Talos itself has no native Helm.
+  extraManifests:
+    - https://github.com/k3s-io/helm-controller/releases/download/v0.17.2/deploy-cluster-scoped.yaml
+
+  inlineManifests:
+    # --- local-path-provisioner (default RWO StorageClass) ---------------
+    # Plain manifest (not Helm) — Rancher's local-path-provisioner patched for
+    # Talos: export path under /var (root fs is read-only), PSA-privileged
+    # namespace (helper pod runs as root + hostPath), marked default SC.
+    - name: local-path-provisioner
+      contents: |-
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: local-path-storage
+          labels:
+            pod-security.kubernetes.io/enforce: privileged
+            pod-security.kubernetes.io/audit: privileged
+            pod-security.kubernetes.io/warn: privileged
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: local-path-provisioner-service-account
+          namespace: local-path-storage
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: local-path-provisioner-role
+          namespace: local-path-storage
+        rules:
+          - apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: local-path-provisioner-role
+        rules:
+          - apiGroups: [""]
+            resources: ["nodes", "persistentvolumeclaims", "configmaps", "pods", "pods/log"]
+            verbs: ["get", "list", "watch"]
+          - apiGroups: [""]
+            resources: ["persistentvolumes"]
+            verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+          - apiGroups: [""]
+            resources: ["events"]
+            verbs: ["create", "patch"]
+          - apiGroups: ["storage.k8s.io"]
+            resources: ["storageclasses"]
+            verbs: ["get", "list", "watch"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: local-path-provisioner-bind
+          namespace: local-path-storage
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: local-path-provisioner-role
+        subjects:
+          - kind: ServiceAccount
+            name: local-path-provisioner-service-account
+            namespace: local-path-storage
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: local-path-provisioner-bind
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: local-path-provisioner-role
+        subjects:
+          - kind: ServiceAccount
+            name: local-path-provisioner-service-account
+            namespace: local-path-storage
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: local-path-provisioner
+          namespace: local-path-storage
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: local-path-provisioner
+          template:
+            metadata:
+              labels:
+                app: local-path-provisioner
+            spec:
+              serviceAccountName: local-path-provisioner-service-account
+              containers:
+                - name: local-path-provisioner
+                  image: rancher/local-path-provisioner:v0.0.31
+                  imagePullPolicy: IfNotPresent
+                  command:
+                    - local-path-provisioner
+                    - --debug
+                    - start
+                    - --config
+                    - /etc/config/config.json
+                  volumeMounts:
+                    - name: config-volume
+                      mountPath: /etc/config/
+                  env:
+                    - name: POD_NAMESPACE
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.namespace
+                    - name: CONFIG_MOUNT_PATH
+                      value: /etc/config/
+              volumes:
+                - name: config-volume
+                  configMap:
+                    name: local-path-config
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata:
+          name: local-path
+          annotations:
+            storageclass.kubernetes.io/is-default-class: "true"
+        provisioner: rancher.io/local-path
+        volumeBindingMode: WaitForFirstConsumer
+        reclaimPolicy: Delete
+        ---
+        kind: ConfigMap
+        apiVersion: v1
+        metadata:
+          name: local-path-config
+          namespace: local-path-storage
+        data:
+          config.json: |-
+            {
+                    "nodePathMap":[
+                    {
+                            "node":"DEFAULT_PATH_FOR_NON_LISTED_NODES",
+                            "paths":["/var/local-path-provisioner"]
+                    }
+                    ]
+            }
+          setup: |-
+            #!/bin/sh
+            set -eu
+            mkdir -m 0777 -p "$VOL_DIR"
+          teardown: |-
+            #!/bin/sh
+            set -eu
+            rm -rf "$VOL_DIR"
+          helperPod.yaml: |-
+            apiVersion: v1
+            kind: Pod
+            metadata:
+              name: helper-pod
+            spec:
+              priorityClassName: system-node-critical
+              tolerations:
+                - key: node.kubernetes.io/disk-pressure
+                  operator: Exists
+                  effect: NoSchedule
+              containers:
+              - name: helper-pod
+                image: busybox
+                imagePullPolicy: IfNotPresent
+
+    # --- NFS-Ganesha provisioner (RWX StorageClass `nfs`) ----------------
+    # Userspace NFS server (no kernel nfsd on Talos), delivered as a HelmChart.
+    # The namespace is pre-created here with PSA `privileged` so Ganesha can use
+    # the DAC_READ_SEARCH / SYS_RESOURCE capabilities (helm-controller's
+    # createNamespace would not set those labels).
+    - name: nfs-server-provisioner
+      contents: |-
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: nfs-storage
+          labels:
+            pod-security.kubernetes.io/enforce: privileged
+            pod-security.kubernetes.io/audit: privileged
+            pod-security.kubernetes.io/warn: privileged
+        ---
+        apiVersion: helm.cattle.io/v1
+        kind: HelmChart
+        metadata:
+          name: nfs-server-provisioner
+          namespace: kube-system
+        spec:
+          repo: https://kubernetes-sigs.github.io/nfs-ganesha-server-and-external-provisioner/
+          chart: nfs-server-provisioner
+          version: "1.8.0"
+          targetNamespace: nfs-storage
+          createNamespace: false
+          valuesContent: |-
+            # Back the NFS export with a local-path PVC (RWO: only the single
+            # server pod mounts it; clients reach it over NFS).
+            persistence:
+              enabled: true
+              storageClass: local-path
+              accessMode: ReadWriteOnce
+              size: 10Gi
+            # The RWX StorageClass that Airflow's logs/dags PVCs request.
+            storageClass:
+              create: true
+              name: nfs
+              defaultClass: false
+              reclaimPolicy: Delete
+              allowVolumeExpansion: true
+              mountOptions:
+                - vers=3
+                - retrans=2
+                - timeo=30
+            # Capabilities Ganesha needs to serve the export.
+            securityContext:
+              capabilities:
+                add:
+                  - DAC_READ_SEARCH
+                  - SYS_RESOURCE
+
+    # --- metrics-server (kubectl top / k9s usage columns) ----------------
+    # Delivered as a HelmChart into kube-system. Talos kubelet serving certs are
+    # self-signed, so we skip TLS verification (fine for a demo; for production
+    # prefer kubelet `rotate-server-certificates` + a serving-cert approver).
+    - name: metrics-server
+      contents: |-
+        apiVersion: helm.cattle.io/v1
+        kind: HelmChart
+        metadata:
+          name: metrics-server
+          namespace: kube-system
+        spec:
+          repo: https://kubernetes-sigs.github.io/metrics-server/
+          chart: metrics-server
+          version: "3.13.1"
+          targetNamespace: kube-system
+          createNamespace: false
+          valuesContent: |-
+            args:
+              - --kubelet-insecure-tls
+              - --kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP

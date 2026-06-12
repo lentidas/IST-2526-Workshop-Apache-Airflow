@@ -1,0 +1,40 @@
+# NFS-Ganesha server + external provisioner — RWX StorageClass for Airflow logs
+# Chart: nfs-ganesha-server-and-external-provisioner/nfs-server-provisioner 1.8.0
+#
+# Provides a ReadWriteMany StorageClass named "nfs", backed by a local-path PVC.
+# Userspace NFS (Ganesha) is used so we don't depend on a kernel nfsd module,
+# which Talos nodes don't expose.
+#
+# Install:
+#   kubectl apply -f storage/nfs-namespace.yaml
+#   helm upgrade --install nfs \
+#     nfs-ganesha-server-and-external-provisioner/nfs-server-provisioner \
+#     --version 1.8.0 -n nfs-storage -f storage/nfs-values.yaml
+
+# Back the NFS server's export with a local-path PVC (RWO is fine: only the
+# single server pod mounts it; clients reach it over NFS).
+persistence:
+  enabled: true
+  storageClass: local-path
+  accessMode: ReadWriteOnce
+  size: 10Gi
+
+# Create the RWX StorageClass that Airflow's logs PVC will request.
+storageClass:
+  create: true
+  name: nfs
+  defaultClass: false
+  reclaimPolicy: Delete
+  allowVolumeExpansion: true
+  mountOptions:
+    - vers=3
+    - retrans=2
+    - timeo=30
+
+# Ganesha needs these capabilities to serve the export (requires a
+# PSA-privileged namespace on Talos).
+securityContext:
+  capabilities:
+    add:
+      - DAC_READ_SEARCH
+      - SYS_RESOURCE

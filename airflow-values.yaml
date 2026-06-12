@@ -1,0 +1,73 @@
+# Apache Airflow Helm values — workshop demo (HEIG-VD IST)
+# Chart: apache-airflow/airflow 1.22.0  (Airflow 3.2.2)
+# Target: Talos cluster (arm64) on colima, default StorageClass = local-path
+#
+# Install:
+#   helm upgrade --install airflow apache-airflow/airflow \
+#     --version 1.22.0 -n airflow --create-namespace -f airflow-values.yaml
+
+# --- Executor -------------------------------------------------------------
+# KubernetesExecutor: every task runs in its own dynamically-created pod.
+# No Celery/Redis broker needed — great for visualising scheduling live.
+executor: KubernetesExecutor
+
+# --- Metadata database ----------------------------------------------------
+# Bundled PostgreSQL (single replica) backed by a PVC on the default
+# local-path StorageClass. Fine for a demo; not for production.
+postgresql:
+  enabled: true
+
+# --- Broker ---------------------------------------------------------------
+# Redis is only used by the CeleryExecutor; disable it explicitly.
+redis:
+  enabled: false
+
+# --- Logs -----------------------------------------------------------------
+# KubernetesExecutor task pods are ephemeral and deleted after the task ends,
+# so the api-server cannot fetch logs from them over :8793 (NameResolutionError).
+# We mount ONE ReadWriteMany volume (NFS-Ganesha StorageClass `nfs`) across the
+# scheduler, api-server, dag-processor, triggerer AND every task pod, so logs are
+# written to shared storage and read back as files — surviving pod deletion.
+logs:
+  persistence:
+    enabled: true
+    storageClassName: nfs
+    size: 5Gi
+
+# --- DAGs -----------------------------------------------------------------
+# No git-sync for the demo. We mount ONE ReadWriteMany volume (NFS-Ganesha
+# StorageClass `nfs`) shared across the scheduler, dag-processor AND every
+# KubernetesExecutor task pod, then deliver DAG files into it with `kubectl cp`.
+# RWX is required because task pods can land on any worker node and must all
+# read the same dags directory.
+dags:
+  persistence:
+    enabled: true
+    storageClassName: nfs
+    accessMode: ReadWriteMany
+    size: 1Gi
+
+# --- Demo admin user (FAB auth manager) -----------------------------------
+# Login: admin / admin  (override before any real exposure).
+# NOTE: migrateDatabaseJob and createUserJob run as Helm post-install hooks
+# (chart default). Install WITHOUT `helm --wait` — combining hooks with
+# `--wait` deadlocks (Helm waits for pods Ready before running the hooks, but
+# the pods' `wait-for-airflow-migrations` init container needs the migration
+# hook first). Monitor readiness manually (kubectl/k9s) instead.
+createUserJob:
+  enabled: true
+  defaultUser:
+    role: Admin
+    username: admin
+    password: admin
+    email: admin@example.com
+    firstName: admin
+    lastName: user
+
+# --- Airflow config -------------------------------------------------------
+# NOTE: `load_examples` set via config.core (airflow.cfg) is IGNORED, because
+# the chart injects AIRFLOW__CORE__LOAD_EXAMPLES=False as an env var, and env
+# vars win over airflow.cfg. So we enable examples through `env` below instead.
+env:
+  - name: AIRFLOW__CORE__LOAD_EXAMPLES
+    value: "True"
