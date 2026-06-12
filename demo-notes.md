@@ -152,6 +152,8 @@ Airflow guarantees the tasks are executed in order and the tasks that run in par
 DP=$(kubectl -n airflow get pod -l component=dag-processor -o name | head -1)
 kubectl -n airflow cp dags/morning_executive_briefing.py \
   "${DP#pod/}":/opt/airflow/dags/morning_executive_briefing.py -c dag-processor
+kubectl -n airflow cp dags/cheatsheet_hello_world.py \
+  "${DP#pod/}":/opt/airflow/dags/cheatsheet_hello_world.py -c dag-processor
 
 # The dags-folder bundle only refreshes ~every 300s. If we are pressed for time, we can force an immediate re-parse by restarting the processor.
 kubectl -n airflow rollout restart deploy/airflow-dag-processor
