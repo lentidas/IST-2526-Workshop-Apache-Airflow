@@ -1,41 +1,20 @@
-# Talos machine-config patch — cluster add-ons (storage + metrics)
-# ================================================================
-# Applied to the control-plane node at `talosctl cluster create` time. Everything
-# under `cluster.*` is read by the bootstrap node and reconciled into the cluster
-# automatically, so a fresh cluster comes up with storage + metrics already wired.
-#
-# How it loads:
-#   - cluster.extraManifests : URLs fetched at bootstrap (here: the k3s
-#     helm-controller, which adds the helm.cattle.io/v1 `HelmChart` CRD + a
-#     controller that runs `helm` for us).
-#   - cluster.inlineManifests: raw YAML embedded below. local-path is a plain
-#     (patched) manifest; nfs + metrics-server are delivered as `HelmChart` CRs
-#     that the helm-controller installs from their upstream Helm repos.
-#
-# Talos retries manifest application until it succeeds, so the HelmChart CRs
-# below tolerate the helm-controller CRD not being ready on the very first pass.
-#
-# Apply:
-#   talosctl cluster create docker ... \
-#     --config-patch-control-plane @cluster/patch-addons.yaml
-
-
 # Machine configuration to add basic storage and metrics add-ons to the Talos K8s cluster at startup.
-
+---
 cluster:
-  # --- Helm support ------------------------------------------------------
-  # k3s helm-controller: installs the `HelmChart` / `HelmChartConfig` CRDs and a
-  # cluster-scoped controller (into kube-system) that turns HelmChart resources
-  # into real `helm install` jobs. This is what lets us "load Helm charts at
-  # startup" — Talos itself has no native Helm.
+  # Install the helm-controller with its cluster-scoped manifest. This allows us to install other Helm charts 
+  # (such as the NFS server and metrics-server) by just creating HelmChart resources, without needing to run 
+  # `helm install` manually or to template the charts into our machine config.
   extraManifests:
     - https://github.com/k3s-io/helm-controller/releases/download/v0.17.2/deploy-cluster-scoped.yaml
 
   inlineManifests:
-    # --- local-path-provisioner (default RWO StorageClass) ---------------
-    # Plain manifest (not Helm) — Rancher's local-path-provisioner patched for
-    # Talos: export path under /var (root fs is read-only), PSA-privileged
-    # namespace (helper pod runs as root + hostPath), marked default SC.
+    # Install local-path-provisioner (default StorageClass for RWO volumes).
+    # Based on official example manifest: https://github.com/rancher/local-path-provisioner/blob/master/deploy/local-path-storage.yaml
+    # Only modifications from the original are:
+    # - Added `pod-security.kubernetes.io/*: privileged` labels to the namespace so the provisioner can run with the 
+    #   needed capabilities on Talos.
+    # - Changed the path the provisioner uses on the host to `/var/local-path-provisioner`, instead of 
+    #   `/opt/local-path-provisioner`.
     - name: local-path-provisioner
       contents: |-
         apiVersion: v1
@@ -198,11 +177,9 @@ cluster:
                 image: busybox
                 imagePullPolicy: IfNotPresent
 
-    # --- NFS-Ganesha provisioner (RWX StorageClass `nfs`) ----------------
-    # Userspace NFS server (no kernel nfsd on Talos), delivered as a HelmChart.
-    # The namespace is pre-created here with PSA `privileged` so Ganesha can use
-    # the DAC_READ_SEARCH / SYS_RESOURCE capabilities (helm-controller's
-    # createNamespace would not set those labels).
+    # Install NFS server provisioner chart (with StorageClass for RWX volumes).
+    # Based on the official Helm chart, but delivered as a HelmChart CRD to be automatically installed by the 
+    # helm-controller we added above. N
     - name: nfs-server-provisioner
       contents: |-
         apiVersion: v1
@@ -226,14 +203,14 @@ cluster:
           targetNamespace: nfs-storage
           createNamespace: false
           valuesContent: |-
-            # Back the NFS export with a local-path PVC (RWO: only the single
-            # server pod mounts it; clients reach it over NFS).
+            # Back the NFS export with a local-path PVC.
+            # The local-path PV is ReadWriteOnce (RWO), only the single server pod mounts it. The client workloads
+            # reach it through a PV of type ReadWriteMany (RWX) over NFS.
             persistence:
               enabled: true
               storageClass: local-path
               accessMode: ReadWriteOnce
               size: 10Gi
-            # The RWX StorageClass that Airflow's logs/dags PVCs request.
             storageClass:
               create: true
               name: nfs
@@ -244,17 +221,18 @@ cluster:
                 - vers=3
                 - retrans=2
                 - timeo=30
-            # Capabilities Ganesha needs to serve the export.
+            # Capabilities Ganesha needs to serve the NFS export.
             securityContext:
               capabilities:
                 add:
                   - DAC_READ_SEARCH
                   - SYS_RESOURCE
 
-    # --- metrics-server (kubectl top / k9s usage columns) ----------------
-    # Delivered as a HelmChart into kube-system. Talos kubelet serving certs are
-    # self-signed, so we skip TLS verification (fine for a demo; for production
-    # prefer kubelet `rotate-server-certificates` + a serving-cert approver).
+    # Installs metrics-server Helm chart to provide K8s metrics.
+    # Notice that Talos' kubelet serves self-signed certs, so we skip TLS verification in the chart values, but in
+    # a production cluster you would want to enable kubelet `rotate-server-certificates` and have them signed by the
+    # cluster CA. We also prefer the node's InternalIP for scraping, since Talos nodes advertise it and it avoids 
+    # potential issues with hostname resolution.
     - name: metrics-server
       contents: |-
         apiVersion: helm.cattle.io/v1
